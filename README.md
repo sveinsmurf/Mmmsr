@@ -9,9 +9,24 @@ Where if one physical server fails the players connected won't notice anything.
 
 The goal is to use COLO "**Co**arse-grained **lo**ck-stepping"
 
+It is to run on a control pc, that then proxy's network requests to the worker pc's.
+
+Those two worker pc's will have one primary and one seccondary pc.
+They will both run the same minecraft server in parallel. 
+When they both recive network signals they will both send back network singals tunneled through the main pc.
+The main pc will then review the outgoing network signals and if they arent the same;
+It will pause the main pc's minecraft server and send a direct copy of the process to the seccondary pc.
+Hence why a determenistic or atleast a low-cpu cost minecraft server would be ideal.
+
+The primary pc will proably also need a backup as that would be a single point of failure.
+
 ### Server setup:
 
+My setup includes Mini-PC's with these specs:
 
+- CPU: Intel Core i5-3470T 2c/4t
+- HDD: 300GB WD3200BEKT SATA
+- RAM: 7.6GiB
 
 ### For server:
 
@@ -32,3 +47,7 @@ Test these server options:
     3. Might have too many features compared to FerrumC
 4. https://github.com/PaperMC/Paper.git
     1. If all-else fails, theres always paper
+
+### Way out plan:
+
+Make the i5-9500 system host a PXE/iPXE server to setup the mini pc's faster and more centralised.
