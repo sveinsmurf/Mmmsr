@@ -2,6 +2,13 @@
 
 ## Plans:
 
+### Idea:
+
+Experiment with redundancy for minecraft servers.
+Where if one physical server fails the players connected won't notice anything.
+
+The goal is to use COLO "**Co**arse-grained **lo**ck-stepping"
+
 ### Server setup:
 
 
