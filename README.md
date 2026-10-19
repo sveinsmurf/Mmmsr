@@ -10,6 +10,10 @@ The two worker pc's are setup with a direct gigabit line between them. with exte
 
 qemu-full, iperf3. tcpdump and htop is installed on all mini pc's
 
+First test on .104:
+
+1. Follow /playground/test1/README.md
+
 ### Idea:
 
 Experiment with redundancy for minecraft servers.
