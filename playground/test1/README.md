@@ -7,6 +7,12 @@ mv Arch-Linux-x86_64-cloudimg.qcow2 primary.qcow2
 qemu-img resize primary.qcow2 10G´´´
 4. Cloud-init seed ´´´cat > user-data <<EOF
 #cloud-config
+bootcmd:
+  - [ip, link, set, eth0, up]
+  - [ip, address, replace, 192.168.35.110/24, dev, eth0]
+  - [ip, route, replace, default, via, 192.168.35.1]
+  - [sh, -c, 'mkdir -p /home/svein/.ssh; touch /home/svein/.ssh/authorized_keys; grep -qxF "$(head -1 ~/.ssh/authorized_keys)" /home/svein/.ssh/authorized_keys || echo "$(head -1 ~/.ssh/authorized_keys)" >> /home/svein/.ssh/authorized_keys; chown -R svein:svein /home/svein/.ssh; chmod 700 /home/svein/.ssh; chmod 600 /home/svein/.ssh/authorized_keys']
+
 users:
   - name: svein
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -20,13 +26,15 @@ version: 2
 ethernets:
   nic:
     match:
-      name: "e*"
-    addresses: [192.168.35.110/24]
+      macaddress: "52:54:00:12:34:56"
+    addresses:
+      - 192.168.35.110/24
     routes:
       - to: default
         via: 192.168.35.1
     nameservers:
-      addresses: [192.168.35.1]
+      addresses:
+        - 192.168.35.1
 EOF
 
 echo "instance-id: colo-test" > meta-data
@@ -37,3 +45,10 @@ xorriso -as mkisofs -o seed.iso -V cidata -J -r user-data meta-data network-conf
   -drive file=primary.qcow2,if=ide \
   -cdrom seed.iso \
   -display none -serial file:vm.log -daemonize -pidfile vm.pid´´´
+
+### Current state on .104
+
+- The VM is running with the command above.
+- `br0` owns `192.168.35.104/24` and has the USB NIC (`enp0s20u1`) attached.
+- `eno1` is the direct worker link and has `10.0.0.2/24`.
+- The guest is reachable at `192.168.35.110`, and SSH access as `svein` works from `.104`.
