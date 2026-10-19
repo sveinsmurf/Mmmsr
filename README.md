@@ -2,6 +2,12 @@
 
 ## Plans:
 
+### Progress so far:
+
+Arch Linux LTS is set up on all mini pc's. They have ssh keys for eachother and password/root ssh access is disabled. 
+
+The two worker pc's are setup with a direct gigabit line between them. with external usb nics's to connect to the network switch.
+
 ### Idea:
 
 Experiment with redundancy for minecraft servers.
@@ -22,11 +28,15 @@ The primary pc will proably also need a backup as that would be a single point o
 
 ### Server setup:
 
-My setup includes Mini-PC's with these specs:
+My setup includes 5 Mini-PC's with these specs:
 
 - CPU: Intel Core i5-3470T 2c/4t
 - HDD: 300GB WD3200BEKT SATA
 - RAM: 7.6GiB
+- NIC: 1Gbe
+
+The two worker servers use their internal nics to talk to eachother directly.
+So they have usb to gigabit ethernet nics that connect correctly to the switch.
 
 ### For server:
 
