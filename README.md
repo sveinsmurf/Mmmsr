@@ -8,6 +8,8 @@ Arch Linux LTS is set up on all mini pc's. They have ssh keys for eachother and 
 
 The two worker pc's are setup with a direct gigabit line between them. with external usb nics's to connect to the network switch.
 
+qemu-full, iperf3. tcpdump and htop is installed on all mini pc's
+
 ### Idea:
 
 Experiment with redundancy for minecraft servers.
