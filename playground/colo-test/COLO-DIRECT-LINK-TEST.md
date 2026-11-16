@@ -68,6 +68,46 @@ Test #1 (see `COLO-TEST.md`) ran the COLO pair on `.103` (primary) ↔ `.105` (s
 
 The secondary's `red1` chardev connected to the primary's port 9004 during an earlier primary incarnation; when the primary QEMU was killed and restarted between setup steps, the secondary's `reconnect-ms=1000` did not re-establish the connection (it stayed `CLOSE-WAIT` while `red0`/9003 did reconnect). Both chardev connections must be verified `ESTAB` on **both** sides before issuing `migrate` — a `ss -tnp | grep 9003/9004` check on each host should be added as an explicit step.
 
+## Repeat run with `tools/colo.py` (2026-11-16)
+
+The new control script was used to repeat the direct-link test with a verified
+proxy channel and a corrected promotion sequence.
+
+- `setup` rebuilt the seed, copied the image over the direct link, and reset the
+  secondary replication disks.
+- `start` reached `query-migrate: status: colo` on both sides.
+- Before migration, all four proxy connections were confirmed `ESTAB` on both
+  hosts: `9003` and `9004` on `.104` and `.105`.
+- The guest booted and answered pings with 0% loss and ~1.1–1.8 ms RTT while in
+  COLO mode.
+- Failover was simulated by stopping the primary QEMU, then running
+  `tools/colo.py failover`. The secondary promoted to `status: completed`, and
+  the guest remained reachable on `.105`.
+- A timestamped ping run received 23 packets across the handoff with no loss
+  lines. The measured gap was 0.201 s, essentially the 0.2 s ping interval, so
+  this run did not reproduce the ~5 s outage seen in test #1.
+
+Correct promotion sequence: stop the secondary's NBD server, send
+`x-colo-lost-heartbeat` to the **secondary**, wait for `query-migrate` to report
+`completed`, and only then stop the old primary. Killing the primary without
+promoting the secondary leaves the guest frozen in COLO mode.
+
+## Retest with the corrected failover path
+
+After fixing the tooling to verify both proxy channels and promote the secondary with `nbd-server-stop` followed by `x-colo-lost-heartbeat`, the direct-link pair was rebuilt and retested end to end on 2026-11-16.
+
+| Metric | Result |
+|--------|--------|
+| Reached `colo` state | ✅ |
+| Proxy channels `ESTAB` on both hosts | ✅ 9003 and 9004 |
+| Guest reachable during COLO | ✅ (1.1–1.8 ms RTT) |
+| Simulated primary failure | ✅ primary QEMU stopped |
+| Secondary promotion | ✅ `query-migrate: completed` |
+| Guest reachable after failover | ✅ |
+| Failover ping gap | 0 lost pings (23/23 received at 0.2 s interval; max gap 0.201 s) |
+
+The corrected sequence matters: killing the primary without first promoting the secondary leaves the secondary in `colo` with the guest frozen. The working promotion path is `nbd-server-stop` → `x-colo-lost-heartbeat` on the secondary.
+
 ## New gotchas (beyond `COLO-TEST.md`)
 
 - **Verify all four chardev connections are `ESTAB` bidirectionally** (9003 and 9004 on both hosts) before starting migration. A half-open comparison channel silently freezes the SVM and withholds all guest network output.
