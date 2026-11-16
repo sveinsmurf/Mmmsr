@@ -15,12 +15,14 @@ image to .105 over the direct 10.0.0.0/24 link. The QEMU guest is configured wit
 """
 
 import argparse
+import hashlib
 import json
 import shlex
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 PRIMARY_HOST = "server@192.168.35.104"
@@ -189,15 +191,18 @@ ip link set '{tap}' up
     remote(host, script, sudo=True)
 
 
-def seed_files(public_key):
+def seed_files(public_keys):
+    keys = "\n".join(f"      - {key}" for key in public_keys)
     user_data = f"""#cloud-config
 users:
   - name: svein
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - {public_key}
+{keys}
 ssh_pwauth: false
+runcmd:
+  - chown -R svein:svein /home/svein
 """
     network_config = f"""version: 2
 ethernets:
@@ -213,7 +218,8 @@ ethernets:
       addresses:
         - 192.168.35.1
 """
-    return user_data, network_config, "instance-id: colo-mmmsr\n"
+    digest = hashlib.sha256((user_data + network_config).encode()).hexdigest()[:12]
+    return user_data, network_config, f"instance-id: colo-mmmsr-{digest}\n"
 
 
 def build_seed(args):
@@ -221,7 +227,14 @@ def build_seed(args):
     public_key, _ = remote(PRIMARY_HOST, "head -n1 ~/.ssh/authorized_keys")
     if not public_key:
         raise CommandError("no public key found for server@" + PRIMARY_IP)
-    user_data, network_config, meta_data = seed_files(public_key)
+    public_keys = [public_key]
+    try:
+        local_key = Path.home().joinpath(".ssh/id_ed25519.pub").read_text().strip()
+    except OSError:
+        local_key = ""
+    if local_key and local_key not in public_keys:
+        public_keys.append(local_key)
+    user_data, network_config, meta_data = seed_files(public_keys)
     script = f"""
 mkdir -p '{PRIMARY_DIR}/seed'
 cat > '{PRIMARY_DIR}/seed/user-data' <<'MMMSR_EOF'
