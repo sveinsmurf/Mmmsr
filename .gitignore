@@ -1,1 +1,7 @@
 tools/__pycache__/
+server/import/
+server/logs/
+server/whitelist.txt
+server/world/
+server/ferrumc
+server/.x86_extract/
