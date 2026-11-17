@@ -54,14 +54,32 @@ class CommandError(RuntimeError):
 
 
 class QMPClient:
-    def __init__(self, host, port, timeout=5.0):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(timeout)
-        self.stream = self.sock.makefile("rb")
-        greeting = json.loads(self.stream.readline())
-        if "QMP" not in greeting:
-            raise CommandError(f"unexpected QMP greeting: {greeting}")
-        self.execute("qmp_capabilities")
+    def __init__(self, host, port, timeout=5.0, retries=10):
+        # The QMP greeting is sent as soon as the socket is accepted, but QEMU
+        # can be slow to accept right after start-up, so retry the connect +
+        # greeting instead of failing the whole run on a transient race.
+        last_error = None
+        for attempt in range(retries):
+            try:
+                self.sock = socket.create_connection((host, port), timeout=timeout)
+                self.sock.settimeout(timeout)
+                self.stream = self.sock.makefile("rb")
+                line = self.stream.readline()
+                if not line:
+                    raise CommandError("empty QMP greeting")
+                greeting = json.loads(line)
+                if "QMP" not in greeting:
+                    raise CommandError(f"unexpected QMP greeting: {greeting}")
+                self.execute("qmp_capabilities")
+                return
+            except (OSError, ValueError, CommandError) as exc:
+                last_error = exc
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        raise CommandError(f"QMP connect to {host}:{port} failed: {last_error}")
 
     def _read_message(self):
         while True:
@@ -125,12 +143,20 @@ def remote_port_open(host, port):
         return False
 
 
-def wait_for_port(host, port, description, timeout=30):
+def wait_for_port(host, port, description, timeout=60):
     print(f"Waiting for {description} on {host}:{port}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if remote_port_open(host, port):
-            return
+            # The socket can accept before QEMU's QMP greeting is ready, so
+            # confirm the greeting too. This removes the intermittent
+            # "timed out waiting for ... QMP" race after a restart.
+            try:
+                qmp = QMPClient(host, port, timeout=5.0, retries=1)
+                qmp.close()
+                return
+            except (OSError, CommandError):
+                pass
         time.sleep(0.5)
     raise CommandError(f"timed out waiting for {description} on {host}:{port}")
 
@@ -201,8 +227,29 @@ users:
     ssh_authorized_keys:
 {keys}
 ssh_pwauth: false
+write_files:
+  - path: /etc/systemd/system/ferrumc.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=FerrumC Minecraft server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=svein
+      WorkingDirectory=/home/svein/ferrumc
+      ExecStart=/home/svein/ferrumc/ferrumc run
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
 runcmd:
   - chown -R svein:svein /home/svein
+  - [systemctl, daemon-reload]
+  - [sh, -c, 'if [ -x /home/svein/ferrumc/ferrumc ]; then systemctl enable --now ferrumc.service; fi']
 """
     network_config = f"""version: 2
 ethernets:

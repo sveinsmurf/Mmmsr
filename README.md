@@ -14,6 +14,20 @@ First test on .104:
 
 1. Follow /playground/test1/README.md
 
+### Current status (2026-11-17)
+
+A working two-node COLO pair now runs the FerrumC server in a guest VM:
+
+- `.104` is the primary QEMU host, `.105` the secondary, over the direct link.
+- The guest is reachable at `192.168.35.110` (Minecraft `25565`, dashboard `9000`).
+- **Automatic failover works in both directions** via `tools/colo-watchdog.py`
+  (one instance per host): pulling the power on either box keeps the guest
+  reachable in roughly 0.3 s. See `tools/README.md` for details.
+- `tools/colo-rejoin.py` re-forms the pair automatically after a host reboots
+  (the guest restarts only at rejoin, never during failover).
+
+Control: `tools/colo.py {setup,start,status,failover,cleanup}`.
+
 ### Idea:
 
 Experiment with redundancy for minecraft servers.
