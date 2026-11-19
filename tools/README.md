@@ -18,6 +18,7 @@ tools/colo.py setup
 tools/colo.py start
 tools/colo.py status
 tools/colo.py failover
+tools/colo.py resume-replication [--survivor auto|primary|secondary]
 tools/colo.py cleanup --reset-disks
 ```
 
@@ -35,7 +36,20 @@ and creates the two TAP interfaces. Existing QEMU VMs are not killed by `setup`.
 
 `--memory` and `--smp` can be placed before any subcommand. `start` defaults to
 1 GiB RAM and one vCPU; a restart therefore resets the guest to cloud-init state
-unless the base image is manually preserved.
+unless the base image is manually preserved. `resume-replication` ignores those
+flags and adopts the surviving QEMU's live RAM/vCPU shape, because migration
+requires an identical machine.
+
+`resume-replication` is the non-disruptive rejoin. It keeps the surviving guest
+running, starts the returning host as a fresh secondary, resyncs the survivor's
+disk into it with `drive-mirror`, then re-forms the pair with a COLO migration.
+It implements QEMU's "Primary resume replication" and "Secondary resume
+replication" sequences, so it works in either direction: after a primary
+failover (survivor has the primary topology) or after a secondary promotion
+(survivor still has the `f1`/`f2`/`rew0` rewriter, which is removed and replaced
+with the primary filters inserted before `rew0`). `--survivor` defaults to
+`auto`, which picks the host whose QEMU is running; pass `primary`/`secondary`
+explicitly when both or neither are running.
 
 `failover` promotes the secondary after the primary heartbeat is lost. It stops
 the secondary's NBD server, sends `x-colo-lost-heartbeat` to the secondary, waits
@@ -53,8 +67,10 @@ maximum gap, so the guest remained reachable throughout.
 - Failover does not reverse roles. Whichever host recovered keeps serving the
   guest. Re-forming a `.104`-primary / `.105`-secondary pair is the job of
   `colo-rejoin.py`.
-- Re-forming the pair restarts the guest (COLO cannot live-resync a diverged
-  pair). The failover path itself is seamless; only the rejoin restarts.
+- Re-forming the pair with `setup` + `start` restarts the guest. Use
+  `resume-replication` instead to keep the guest running; it only pauses it for
+  the COLO RAM transfer (about 5 s for the 1 GiB guest here), which is well
+  inside Minecraft's connection timeout.
 - `cleanup --reset-disks` only recreates replication disks while QEMU is stopped.
 - A successful migration leaves the original primary's QEMU process in a
   post-migration state; use `cleanup` before starting a fresh pair.
@@ -175,17 +191,24 @@ pull the other" drop the guest.
 
 The daemon polls both QMP endpoints every `--interval` seconds. If the peer host
 is reachable but the pair is not healthy (`colo` on both sides) for two
-consecutive checks, it re-forms the pair by running `colo.py setup` then
-`colo.py start`, retrying through the QMP greeting race. It sets
+consecutive checks, it works out which QEMU is still running (the survivor) and
+runs `colo.py resume-replication --survivor <role>`. That keeps the surviving
+guest running while the returning host is resynced and re-COLOed. It sets
 `/tmp/colo-maintenance` on both hosts while it works so the watchdogs do not
 interfere.
 
-Re-forming performs a fresh migration, so the **guest restarts** at rejoin. That
-is inherent to COLO; there is no live re-sync of a diverged pair. Failover never
-restarts the guest.
+The old `setup` + `start` sequence is kept only as a last-resort fallback for the
+case where **both** QEMUs are gone (no survivor); that path does reboot the
+guest. Whenever one host is still serving the guest, the daemon uses the
+non-disruptive path. If both QEMUs are alive but the pair is not COLO (a split
+brain), the daemon refuses to act rather than rebooting a guest that is still
+running.
 
-Measured on 2026-11-17: a host that was power-pulled and returned was re-joined
-into a healthy `colo` pair automatically in ~68 s (including the guest reboot).
+Measured on 2026-11-19: `pull .105 -> .104 primary-failover -> .105 returns ->
+daemon auto-rejoin -> pull .104 -> .105 resumes -> daemon auto-rejoin` kept the
+guest connected throughout. Each automatic rejoin froze the guest for ~5 s (the
+COLO RAM transfer) and neither rejoin rebooted the guest. The returning host's
+disk resync (~20 s for the ~1 GiB used image) runs while the guest stays live.
 
 Control:
 

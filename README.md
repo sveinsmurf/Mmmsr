@@ -14,7 +14,7 @@ First test on .104:
 
 1. Follow /playground/test1/README.md
 
-### Current status (2026-11-17)
+### Current status (2026-11-19)
 
 A working two-node COLO pair now runs the FerrumC server in a guest VM:
 
@@ -23,10 +23,13 @@ A working two-node COLO pair now runs the FerrumC server in a guest VM:
 - **Automatic failover works in both directions** via `tools/colo-watchdog.py`
   (one instance per host): pulling the power on either box keeps the guest
   reachable in roughly 0.3 s. See `tools/README.md` for details.
-- `tools/colo-rejoin.py` re-forms the pair automatically after a host reboots
-  (the guest restarts only at rejoin, never during failover).
+- **Automatic rejoin is non-disruptive** via `tools/colo-rejoin.py`: when the
+  pulled host returns, the surviving host stays primary and the returning host
+  is resynced and re-COLOed as the new secondary. The guest is never rebooted;
+  it is frozen only for the ~5 s COLO RAM transfer. Pulling power on the
+  re-formed pair works too. See `tools/README.md` for details.
 
-Control: `tools/colo.py {setup,start,status,failover,cleanup}`.
+Control: `tools/colo.py {setup,start,status,failover,resume-replication,cleanup}`.
 
 ### Idea:
 

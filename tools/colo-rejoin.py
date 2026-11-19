@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto-rejoin daemon: keeps the COLO pair formed.
+"""Auto-rejoin daemon: keeps the COLO pair formed without dropping players.
 
 Runs on the designated primary (.104). The failover watchdogs keep the guest
 alive when a host dies, but after a rebooted host comes back the pair is *not*
@@ -9,12 +9,18 @@ what made "reboot one box, then pull the other" drop the guest.
 
 This daemon closes that gap. Every interval it checks whether both QMP
 endpoints report `colo`. If the peer host is reachable but the pair is not
-healthy for two consecutive checks, it re-forms the pair by running the same
-sequence as `colo.py setup` + `colo.py start`.
+healthy for two consecutive checks, it re-forms the pair with
+`colo.py resume-replication`, which keeps the surviving guest running: the
+returning host is started as a secondary, the survivor's disk is resynced into
+it with drive-mirror, and the pair is re-COLOed with a live migration. The guest
+is only briefly paused for the COLO RAM sync, so connected players are not
+dropped.
 
-COLO cannot live-resync a diverged pair, so re-forming performs a fresh
-migration and the guest restarts. That restart happens only at rejoin, never on
-the failover path (failover is seamless).
+The daemon runs on .104, so it cannot assume which host survived; it works that
+out from the QMP endpoints and tells `resume-replication` which host kept
+serving the guest. The old `setup` + `start` sequence is kept only as a
+last-resort fallback for a pair with no survivor at all (both QEMUs gone); that
+path does reboot the guest.
 
 Usage:
     colo-rejoin.py [--colo-py /home/server/colo.py] [--peer-lan 192.168.35.105] \
@@ -86,6 +92,58 @@ def split_host_port(value):
     return host, int(port)
 
 
+def query_status(host, port, timeout=4.0):
+    """Return query-status for a QMP endpoint, or None if unreachable."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+        stream = sock.makefile("rb")
+        stream.readline()  # greeting
+        sock.sendall(b'{"execute": "qmp_capabilities"}\n')
+        json.loads(stream.readline())
+        sock.sendall(b'{"execute": "query-status"}\n')
+        while True:
+            message = json.loads(stream.readline())
+            if "event" in message:
+                continue
+            return message.get("return")
+    except (OSError, ValueError, RuntimeError):
+        return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def survivor_hint(primary, secondary):
+    """Return the --survivor value for colo.py resume-replication.
+
+    ``primary``/``secondary`` are the query-status dicts for .104/.105 (None
+    when the endpoint is unreachable). A reachable QEMU is a survivor even if
+    its guest is paused: the watchdog may still be recovering it, and
+    resume-replication can unfreeze it. Returns None only when neither QEMU is
+    reachable or when both are reachable but neither guest is running (a split
+    brain), so the caller never reboots a guest that is still alive.
+    """
+    if primary is None and secondary is None:
+        return None
+    if secondary is None:
+        return "primary"
+    if primary is None:
+        return "secondary"
+    p_run = bool(primary.get("running"))
+    s_run = bool(secondary.get("running"))
+    if p_run and not s_run:
+        return "primary"
+    if s_run and not p_run:
+        return "secondary"
+    return None
+
+
 def set_maintenance(hosts, on):
     action = "touch" if on else "rm -f"
     for host in hosts:
@@ -145,33 +203,68 @@ def main(argv=None):
             if unhealthy < 2:
                 continue
 
-            log("re-forming COLO pair (setup + start)")
             set_maintenance(hosts, True)
             started = time.time()
             ok = False
-            for attempt in range(1, args.attempts + 1):
-                for step in ("setup", "start"):
+
+            # Prefer the non-disruptive path: the host that is still running
+            # keeps serving the guest while the returning host is resynced.
+            # Only fall back to setup + start (which reboots the guest) when
+            # neither QEMU is running, so there is no survivor to keep.
+            p_state = query_status(p_host, p_port)
+            s_state = query_status(s_host, s_port)
+            hint = survivor_hint(p_state, s_state)
+            if hint is None and p_state and s_state:
+                # Both QEMUs are alive but the pair is not COLO. That is a
+                # split brain; setup + start would kill both and reboot the
+                # guest. Refuse and leave the watchdogs to sort it out.
+                log("both QEMUs are running but the pair is not COLO "
+                    "(split brain); refusing to reboot the guest")
+                set_maintenance(hosts, False)
+                unhealthy = 0
+                continue
+            if hint is not None:
+                log(f"re-forming COLO pair in place (survivor={hint})")
+                for attempt in range(1, args.attempts + 1):
                     result = subprocess.run(
                         ["python3", args.colo_py, "--memory", str(args.memory),
-                         "--smp", str(args.smp), step],
+                         "--smp", str(args.smp), "resume-replication",
+                         "--survivor", hint],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                         timeout=900,
                     )
-                    if result.returncode != 0:
-                        tail = "\n".join(result.stdout.strip().splitlines()[-6:])
-                        log(f"{step} failed on attempt {attempt} "
-                            f"(rc={result.returncode}):\n{tail}")
+                    if result.returncode == 0:
+                        ok = True
                         break
-                else:
-                    # both steps succeeded
-                    ok = True
-                    break
-                # The known QMP greeting race makes start flaky right after a
-                # reboot; tear down and try again.
-                subprocess.run(["python3", args.colo_py, "cleanup"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=120)
-                time.sleep(5)
+                    tail = "\n".join(result.stdout.strip().splitlines()[-8:])
+                    log(f"resume-replication failed on attempt {attempt} "
+                        f"(rc={result.returncode}):\n{tail}")
+                    time.sleep(5)
+            else:
+                log("no running survivor; re-forming COLO pair (setup + start)")
+                for attempt in range(1, args.attempts + 1):
+                    for step in ("setup", "start"):
+                        result = subprocess.run(
+                            ["python3", args.colo_py, "--memory", str(args.memory),
+                             "--smp", str(args.smp), step],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            timeout=900,
+                        )
+                        if result.returncode != 0:
+                            tail = "\n".join(result.stdout.strip().splitlines()[-6:])
+                            log(f"{step} failed on attempt {attempt} "
+                                f"(rc={result.returncode}):\n{tail}")
+                            break
+                    else:
+                        # both steps succeeded
+                        ok = True
+                        break
+                    # The known QMP greeting race makes start flaky right after
+                    # a reboot; tear down and try again.
+                    subprocess.run(["python3", args.colo_py, "cleanup"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=120)
+                    time.sleep(5)
             set_maintenance(hosts, False)
             if ok:
                 log(f"re-formed pair in {time.time() - started:.1f}s")
