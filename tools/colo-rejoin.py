@@ -119,15 +119,41 @@ def query_status(host, port, timeout=4.0):
             pass
 
 
+def query_colo(host, port, timeout=4.0):
+    """Return the COLO mode for a QMP endpoint, or None if unreachable."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+        stream = sock.makefile("rb")
+        stream.readline()  # greeting
+        sock.sendall(b'{"execute": "qmp_capabilities"}\n')
+        json.loads(stream.readline())
+        sock.sendall(b'{"execute": "query-colo-status"}\n')
+        while True:
+            message = json.loads(stream.readline())
+            if "event" in message:
+                continue
+            return (message.get("return") or {}).get("mode")
+    except (OSError, ValueError, RuntimeError):
+        return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def survivor_hint(primary, secondary):
     """Return the --survivor value for colo.py resume-replication.
 
-    ``primary``/``secondary`` are the query-status dicts for .104/.105 (None
-    when the endpoint is unreachable). A reachable QEMU is a survivor even if
-    its guest is paused: the watchdog may still be recovering it, and
-    resume-replication can unfreeze it. Returns None only when neither QEMU is
-    reachable or when both are reachable but neither guest is running (a split
-    brain), so the caller never reboots a guest that is still alive.
+    ``primary``/``secondary`` are status dicts for .104/.105 (None when the
+    endpoint is unreachable). A COLO secondary is paused by design, so
+    ``query-status.running`` is false on both hosts for most of the time. The
+    COLO mode is the reliable signal: a primary reports "primary", a secondary
+    reports "secondary", and a standalone/failed host reports "none".
     """
     if primary is None and secondary is None:
         return None
@@ -135,6 +161,16 @@ def survivor_hint(primary, secondary):
         return "primary"
     if primary is None:
         return "secondary"
+
+    p_mode = (primary.get("colo") or "").lower()
+    s_mode = (secondary.get("colo") or "").lower()
+    if p_mode == "primary" and s_mode != "primary":
+        return "primary"
+    if s_mode == "primary" and p_mode != "primary":
+        return "secondary"
+
+    # No COLO authority: fall back to a running guest, but never pick a
+    # paused secondary during a migration transition.
     p_run = bool(primary.get("running"))
     s_run = bool(secondary.get("running"))
     if p_run and not s_run:
@@ -197,6 +233,15 @@ def main(argv=None):
                 unhealthy = 0
                 continue
 
+            # A QEMU mid-migration reports "setup"/"inmigrate"/"active" for a
+            # few seconds. That is a healthy in-flight rejoin, not a broken
+            # pair; leave it alone so the daemon cannot pick a paused
+            # secondary as the survivor.
+            in_flight = {"setup", "inmigrate", "active", "postmigrate"}
+            if p_status in in_flight or s_status in in_flight:
+                unhealthy = 0
+                continue
+
             unhealthy += 1
             log(f"pair not healthy (primary={p_status} secondary={s_status}); "
                 f"check {unhealthy}")
@@ -213,6 +258,10 @@ def main(argv=None):
             # neither QEMU is running, so there is no survivor to keep.
             p_state = query_status(p_host, p_port)
             s_state = query_status(s_host, s_port)
+            if p_state is not None:
+                p_state["colo"] = query_colo(p_host, p_port)
+            if s_state is not None:
+                s_state["colo"] = query_colo(s_host, s_port)
             hint = survivor_hint(p_state, s_state)
             if hint is None and p_state and s_state:
                 # Both QEMUs are alive but the pair is not COLO. That is a

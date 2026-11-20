@@ -7,6 +7,9 @@
 - `10.0.0.2` and `10.0.0.1` are the direct-link addresses used by COLO replication.
 - The guest uses `192.168.35.110` and MAC `52:54:00:12:34:56`.
 
+Those are the original roles. After a failover the live pair can be reversed;
+the role is whatever QMP reports (`query-colo-status`), not the host address.
+
 The script must be run from a workstation with passwordless SSH access to both
 hosts as the `server` user. It also expects passwordless sudo on both hosts for
 bridge/TAP setup.
@@ -51,6 +54,13 @@ with the primary filters inserted before `rew0`). `--survivor` defaults to
 `auto`, which picks the host whose QEMU is running; pass `primary`/`secondary`
 explicitly when both or neither are running.
 
+`start` and `resume-replication` set the COLO checkpoint interval to 500 ms
+(`--checkpoint-delay`, default `500` ms). COLO withholds guest output until the
+next checkpoint; QEMU's 20 s default is longer than Minecraft's client timeout,
+so players saw "LAN server" entries that then timed out. The 500 ms interval keeps
+the same guest running while staying inside the client timeout. On this pair a
+500 ms interval measured a steady ~0.8 s Minecraft status ping.
+
 `failover` promotes the secondary after the primary heartbeat is lost. It stops
 the secondary's NBD server, sends `x-colo-lost-heartbeat` to the secondary, waits
 for `query-migrate` to report `completed`, and stops the old primary if it is
@@ -71,6 +81,9 @@ maximum gap, so the guest remained reachable throughout.
   `resume-replication` instead to keep the guest running; it only pauses it for
   the COLO RAM transfer (about 5 s for the 1 GiB guest here), which is well
   inside Minecraft's connection timeout.
+- COLO's checkpoint delay defaults to 20 s in QEMU. Always set it to 500 ms on a
+  live Minecraft server; otherwise a reachable server still looks like a
+  timeout to clients. The tools now do this automatically.
 - `cleanup --reset-disks` only recreates replication disks while QEMU is stopped.
 - A successful migration leaves the original primary's QEMU process in a
   post-migration state; use `cleanup` before starting a fresh pair.
@@ -161,6 +174,12 @@ answering ICMP and is ignored, so a false promotion (split-brain) cannot happen.
 After recovering, the watchdog stays quiet until the peer returns (so a primary
 that still reports `colo` after failover is not re-processed on every poll).
 
+Role detection uses `query-colo-status`, not `query-status.running`. A healthy
+COLO secondary is *paused* while it waits for the primary's checkpoints, so
+`running: false` is normal and must not be treated as "no usable guest". An
+earlier version gated promotion on `running`, which left `.105` stuck as a
+paused primary when `.104` went down. The gate is removed.
+
 Measured on 2026-11-17 (50 pings/s at the guest, peer QEMU killed and both its
 links dropped):
 
@@ -192,8 +211,11 @@ pull the other" drop the guest.
 The daemon polls both QMP endpoints every `--interval` seconds. If the peer host
 is reachable but the pair is not healthy (`colo` on both sides) for two
 consecutive checks, it works out which QEMU is still running (the survivor) and
-runs `colo.py resume-replication --survivor <role>`. That keeps the surviving
-guest running while the returning host is resynced and re-COLOed. It sets
+runs `colo.py resume-replication --survivor <role>`. Mid-migration states
+(`setup`, `inmigrate`, `active`, `postmigrate`) are treated as healthy in-flight
+rejoins and skipped, so the daemon cannot latch onto a paused secondary during a
+transition. That keeps the surviving guest running while the returning host is
+resynced and re-COLOed. It sets
 `/tmp/colo-maintenance` on both hosts while it works so the watchdogs do not
 interfere.
 
@@ -210,12 +232,72 @@ guest connected throughout. Each automatic rejoin froze the guest for ~5 s (the
 COLO RAM transfer) and neither rejoin rebooted the guest. The returning host's
 disk resync (~20 s for the ~1 GiB used image) runs while the guest stays live.
 
+Reboot test on 2026-11-20 (`reboot .105`, wait for rejoin, then `reboot .104`):
+the first run exposed the paused-secondary gate and `.105` failed to promote;
+after the fix, `.105` promoted in **0.356 s** when `.104` went down. The guest
+stayed reachable throughout, but the Minecraft client saw a ~2 s connection
+drop on each switch and had to reconnect. The guest itself came back healthy.
+
 Control:
 
 ```sh
 ssh server@192.168.35.104 'sudo systemctl status colo-rejoin.service'
 ssh server@192.168.35.104 'sudo systemctl stop colo-rejoin.service'   # pause
 ```
+
+## Live monitor
+
+`tools/colo-monitor.py` serves an animated page of the pair. The guest (`110`)
+is a square floating in space; whichever host is primary holds it. When that host
+dies it dims and falls asleep, and the square drifts over to the other host.
+
+The monitor polls each host's **state agent** over HTTP, so it never SSHes and a
+dead host cannot stall the page. Deploy the agents once:
+
+```sh
+python3 tools/colo.py deploy-agent
+```
+
+That installs `tools/colo-agent.py` as `colo-agent.service` on both hosts
+(enabled, so it survives reboots) and serves `GET /state` on port 9100. Then run
+the monitor on the workstation:
+
+```sh
+python3 tools/colo-monitor.py            # http://127.0.0.1:8080/
+python3 tools/colo-monitor.py --port 8080 --bind 0.0.0.0   # reachable over Tailscale
+```
+
+It binds all interfaces by default, so `http://<tailscale-ip>:8080/` works from
+another machine. Pass `--bind 127.0.0.1` to keep it local-only.
+
+The agent is read-only: it runs QMP `query-migrate` / `query-status` and `pgrep`
+locally and returns JSON. The monitor polls both agents plus a ping to the guest
+once a second and drives the scene from that.
+
+The scene also shows the pair state (`COLO pair healthy`, `failover`,
+`rejoining`, `split brain`, `both hosts down`) and a role-change log. It is a
+workstation tool: nothing is installed on the workstation beyond Python.
+
+## Troubleshooting
+
+**Minecraft says "connection reset" but the guest pings and the dashboard is up.**
+Capture at the guest's game port first. If the client sends FIN/RST and the guest
+sends nothing, the guest's application layer is not answering; the network and
+COLO are fine. A capture during a failover shows this as a burst of late
+SYN-ACKs, not a server RST. If the guest's TCP stack still accepts connections
+but Minecraft handshakes time out, `ferrumc.service` inside the guest is wedged
+and needs a restart. The guest seed does not enable `sshd`, so use the QEMU
+console or add SSH to the seed. `colo.py` does not restart the guest's server.
+
+**The monitor shows the wrong primary.** The agent reports the role from QMP
+`query-colo-status`, not from the migration socket. If a host shows a stale
+role, redeploy the agents with `python3 tools/colo.py deploy-agent` and restart
+`tools/colo-monitor.py`.
+
+**A host refuses to promote after the peer dies.** Check that the deployed
+watchdog is the fixed version: a healthy COLO secondary is paused, so promotion
+must key off `query-colo-status`, not `query-status.running`. Re-copy
+`tools/colo-watchdog.py` to both hosts and restart the service.
 
 ## Deployment summary
 

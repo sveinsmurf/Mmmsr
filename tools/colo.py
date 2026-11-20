@@ -43,6 +43,7 @@ LOCAL_COMPARE_IN_PORT = 9001
 LOCAL_COMPARE_OUT_PORT = 9005
 NBD_PORT = 9999
 INCOMING_PORT = 9998
+CHECKPOINT_DELAY_MS = 500
 
 VM_IP = "192.168.35.110"
 VM_MAC = "52:54:00:12:34:56"
@@ -147,6 +148,21 @@ def remote(host, script, sudo=False, check=True, timeout=900):
             f"{result.stdout}{result.stderr}"
         )
     return result.stdout.strip(), result.stderr.strip()
+
+
+def write_remote_file(host, path, payload, sudo=False):
+    """Write bytes to a file on a host without shell quoting problems."""
+    command = ["ssh", "-o", "BatchMode=yes", host]
+    if sudo:
+        command += ["sudo", "-n", "tee", path]
+    else:
+        command += ["tee", path]
+    result = subprocess.run(command, input=payload, capture_output=True)
+    if result.returncode != 0:
+        raise CommandError(
+            f"failed to write {path} on {host}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
 
 
 def local(args, check=True):
@@ -531,13 +547,25 @@ def migrate(args):
             if time.time() >= deadline:
                 raise CommandError(f"migration timed out: {result}")
             time.sleep(1)
-        if args.checkpoint_delay is not None:
-            qmp.execute("migrate-set-parameters", {
-                "x-checkpoint-delay": args.checkpoint_delay
-            })
+        set_checkpoint_delay(qmp, args.checkpoint_delay)
     finally:
         qmp.close()
     print("COLO lock-stepping is active")
+
+
+def set_checkpoint_delay(qmp, delay_ms):
+    """Set the COLO checkpoint interval.
+
+    COLO holds guest output until the next checkpoint. QEMU's default is 20 s,
+    which is longer than Minecraft's client timeout and made players time out
+    even though the guest was alive. 1 s keeps the checkpoint overhead small
+    while leaving the client's connection alive. 500 ms measured a steady
+    ~0.8 s Minecraft status ping on this pair, with no multi-second spikes.
+    """
+    if delay_ms is None:
+        delay_ms = CHECKPOINT_DELAY_MS
+    qmp.execute("migrate-set-parameters", {"x-checkpoint-delay": delay_ms})
+    print(f"COLO checkpoint delay: {delay_ms} ms")
 
 
 def qmp_migrate_status(host, port, timeout=4.0):
@@ -836,6 +864,7 @@ def resume_replication_on_survivor(args, survivor, returner):
         qmp.execute("migrate", {"uri": f"tcp:{returner.direct_ip}:{INCOMING_PORT}"})
         step("migrate started")
         wait_for_colo(qmp, args.timeout)
+        set_checkpoint_delay(qmp, args.checkpoint_delay)
         step("COLO live")
         running = qmp_is_running(survivor.lan_ip, survivor.qmp_port)
         if running is not True:
@@ -960,6 +989,15 @@ def resume_replication(args):
     prepare_returning_disks(survivor, returner)
     start_returning_secondary(args, returner, survivor)
     resume_replication_on_survivor(args, survivor, returner)
+    # COLO's checkpoint delay is a per-QEMU migration parameter. The primary
+    # already has it from set_checkpoint_delay(), but the returning secondary
+    # starts with QEMU's 20 s default unless it is set explicitly. A 20 s
+    # window makes clients time out even though the guest is alive.
+    qmp = QMPClient(returner.lan_ip, returner.qmp_port)
+    try:
+        set_checkpoint_delay(qmp, args.checkpoint_delay)
+    finally:
+        qmp.close()
     print("Resume complete")
 
 
@@ -1022,6 +1060,47 @@ def failover(args):
     print(f"Failover complete; guest is now served by {SECONDARY_IP}")
 
 
+AGENT_PORT = 9100
+
+AGENT_UNIT = """[Unit]
+Description=COLO state agent (local QMP read-only HTTP endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=server
+ExecStart=/usr/bin/python3 /home/server/colo-agent.py --name {name} --qmp-port {qmp_port} --port {port}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def deploy_agent(args):
+    """Install and start the state agent on both hosts.
+
+    The monitor polls these over HTTP instead of SSHing, so a slow or dead host
+    cannot stall the page.
+    """
+    source = Path(__file__).with_name("colo-agent.py").read_bytes()
+    for spec in (PRIMARY, SECONDARY):
+        name = spec.lan_ip.split(".")[-1]
+        print(f"Deploying the state agent to {spec.lan_ip} (: {args.agent_port})")
+        remote(spec.ssh_host, "mkdir -p /home/server")
+        write_remote_file(spec.ssh_host, "/home/server/colo-agent.py", source)
+        remote(spec.ssh_host, "chmod +x /home/server/colo-agent.py")
+        unit = AGENT_UNIT.format(name=name, qmp_port=spec.qmp_port,
+                                 port=args.agent_port)
+        write_remote_file(spec.ssh_host, "/etc/systemd/system/colo-agent.service",
+                          unit.encode(), sudo=True)
+        remote(spec.ssh_host, "systemctl daemon-reload", sudo=True)
+        remote(spec.ssh_host, "systemctl enable --now colo-agent.service", sudo=True)
+        print(f"  agent on {spec.lan_ip} listening on :{args.agent_port}")
+
+
 def cleanup(args):
     stop_qemu(PRIMARY_HOST, "/tmp/colo-primary.pid", PRIMARY_QMP)
     stop_qemu(SECONDARY_HOST, "/tmp/colo-secondary.pid", SECONDARY_QMP)
@@ -1071,11 +1150,18 @@ def parse_args(argv=None):
         "resume-replication",
         help="non-disruptive rejoin: re-COLO the pair without restarting the guest")
     resume_parser.add_argument("--timeout", type=int, default=300)
+    resume_parser.add_argument("--checkpoint-delay", type=int, default=None,
+                               help="COLO checkpoint interval in ms (default: 500)")
     resume_parser.add_argument(
         "--survivor", default="auto",
         help="which host kept serving the guest: auto, primary, secondary, "
              "or an IP address (default: auto)")
     resume_parser.set_defaults(func=resume_replication)
+
+    agent_parser = subparsers.add_parser(
+        "deploy-agent", help="install the HTTP state agent on both hosts")
+    agent_parser.add_argument("--agent-port", type=int, default=AGENT_PORT)
+    agent_parser.set_defaults(func=deploy_agent)
 
     cleanup_parser = subparsers.add_parser("cleanup", help="stop both QEMUs")
     cleanup_parser.add_argument("--reset-disks", action="store_true",
@@ -1086,6 +1172,8 @@ def parse_args(argv=None):
     if args.command == "start":
         args.timeout = 180
         args.checkpoint_delay = None
+    if args.command == "resume-replication" and args.checkpoint_delay is None:
+        args.checkpoint_delay = CHECKPOINT_DELAY_MS
     return args
 
 

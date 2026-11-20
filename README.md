@@ -20,16 +20,31 @@ A working two-node COLO pair now runs the FerrumC server in a guest VM:
 
 - `.104` is the primary QEMU host, `.105` the secondary, over the direct link.
 - The guest is reachable at `192.168.35.110` (Minecraft `25565`, dashboard `9000`).
+- COLO's checkpoint interval is set to 500 ms. QEMU's 20 s default is longer than
+  Minecraft's client timeout, so a reachable server would still look "offline";
+  the tools set 500 ms automatically.
 - **Automatic failover works in both directions** via `tools/colo-watchdog.py`
   (one instance per host): pulling the power on either box keeps the guest
-  reachable in roughly 0.3 s. See `tools/README.md` for details.
+  reachable in roughly 0.3 s. See `tools/README.md` for details. A healthy COLO
+  secondary is paused by design, so the watchdog promotes on the COLO role
+  (`query-colo-status`), not on `query-status.running`; gating on `running`
+  blocked legitimate failover when the primary died.
 - **Automatic rejoin is non-disruptive** via `tools/colo-rejoin.py`: when the
   pulled host returns, the surviving host stays primary and the returning host
   is resynced and re-COLOed as the new secondary. The guest is never rebooted;
   it is frozen only for the ~5 s COLO RAM transfer. Pulling power on the
   re-formed pair works too. See `tools/README.md` for details.
 
+Known issue: after a long COLO pause the guest's FerrumC process can stop
+answering Minecraft logins even though the VM, its TCP stack and the dashboard
+are healthy. Restarting `ferrumc.service` inside the guest clears it. The guest
+SSH server is not enabled in the seed, so this currently needs the QEMU console.
+
 Control: `tools/colo.py {setup,start,status,failover,resume-replication,cleanup}`.
+Watch it live: `python3 tools/colo.py deploy-agent` installs a tiny HTTP state
+agent on both hosts, then `python3 tools/colo-monitor.py` serves an animated page
+on `http://127.0.0.1:8080/` (or `http://<tailscale-ip>:8080/` from another
+machine) where the guest `110` is a square held by whichever host is primary.
 
 ### Idea:
 

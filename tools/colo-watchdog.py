@@ -152,6 +152,22 @@ def local_migrate(port):
         qmp.close()
 
 
+def local_running(port):
+    """Return whether this host's QEMU is actually running its guest.
+
+    A COLO secondary reports ``query-migrate`` status ``colo`` even while its
+    guest is paused waiting for the primary's checkpoints. That QEMU is not a
+    usable survivor: promoting it would stop the real guest and expose an
+    empty secondary. Only ``query-status.running`` tells us whether this host
+    can keep serving the guest.
+    """
+    qmp = QMPClient("127.0.0.1", port)
+    try:
+        return bool(qmp.execute("query-status").get("running"))
+    finally:
+        qmp.close()
+
+
 def local_status(port):
     status, _ = local_migrate(port)
     return status
