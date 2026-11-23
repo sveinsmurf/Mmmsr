@@ -640,6 +640,10 @@ class Monitor:
                          "guest": {"up": False, "ping": None, "ports": {}},
                          "updated": 0}
         self.pool = ThreadPoolExecutor(max_workers=4)
+        # Guest probes get their own pool: a slow SSH fallback to a host must
+        # not delay the guest ping/TCP check, or the page reports a false
+        # "port down" while the server is actually healthy.
+        self.guest_pool = ThreadPoolExecutor(max_workers=2)
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -654,9 +658,12 @@ class Monitor:
                 key: self.pool.submit(self._probe, key, cfg)
                 for key, cfg in HOSTS.items()
             }
-            ping_future = self.pool.submit(ping_guest, GUEST_IP, 1.0)
-            port_future = self.pool.submit(
-                tcp_probe, GUEST_IP, GUEST_PORTS[0], 0.5)
+            ping_future = self.guest_pool.submit(ping_guest, GUEST_IP, 1.0)
+            # COLO withholds guest output until the next checkpoint, so a
+            # healthy guest can take over a second to answer a SYN. A 0.5 s
+            # timeout produced false "port down" readings on a live server.
+            port_future = self.guest_pool.submit(
+                tcp_probe, GUEST_IP, GUEST_PORTS[0], 2.0)
             hosts = {}
             for key, future in futures.items():
                 try:
