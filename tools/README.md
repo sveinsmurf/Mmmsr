@@ -71,22 +71,33 @@ maximum gap, so the guest remained reachable throughout.
 
 ## Important limitations
 
-- Automatic failover is provided by `colo-watchdog.py` (see below), not by QEMU
-  itself. QEMU has no heartbeat daemon; the watchdog supplies the missing
-  heartbeat.
-- Failover does not reverse roles. Whichever host recovered keeps serving the
-  guest. Re-forming a `.104`-primary / `.105`-secondary pair is the job of
-  `colo-rejoin.py`.
+- Automatic failover is provided by `colo-watchdog.py` (see below), not by
+  QEMU itself. QEMU has no heartbeat daemon; the watchdog supplies the
+  missing heartbeat.
+- Failover does not reverse roles. Whichever host recovered keeps serving
+  the guest. Re-forming a `.104`-primary / `.105`-secondary pair is the job
+  of `colo-rejoin.py`.
 - Re-forming the pair with `setup` + `start` restarts the guest. Use
-  `resume-replication` instead to keep the guest running; it only pauses it for
-  the COLO RAM transfer (about 5 s for the 1 GiB guest here), which is well
-  inside Minecraft's connection timeout.
-- COLO's checkpoint delay defaults to 20 s in QEMU. Always set it to 500 ms on a
-  live Minecraft server; otherwise a reachable server still looks like a
-  timeout to clients. The tools now do this automatically.
-- `cleanup --reset-disks` only recreates replication disks while QEMU is stopped.
+  `resume-replication` instead to keep the guest running; it only pauses it
+  for the COLO RAM transfer (about 5 s for the 1 GiB guest here), which is
+  well inside Minecraft's connection timeout.
+- COLO's checkpoint delay defaults to 20 s in QEMU. Always set it to 500 ms
+  on a live Minecraft server; otherwise a reachable server still looks like
+  a timeout to clients. The tools now do this automatically.
+- `cleanup --reset-disks` only recreates replication disks while QEMU is
+  stopped.
 - A successful migration leaves the original primary's QEMU process in a
   post-migration state; use `cleanup` before starting a fresh pair.
+- **COLO disk I/O is dominated by the secondary's HDD.** With COLO active,
+  guest fsync latency is 440–660 ms (p99 >1 s) vs 40–53 ms standalone —
+  a ~10–13× penalty. The link (0.23 ms, 911 Mbit/s) and checkpoint interval
+  are not the cause; the secondary's HDD servicing every replicated write
+  is (see `playground/colo-test/RESULTS-2026-11-23.md`). For a production
+  setup, put the secondary's replication disks on an SSD/NVMe.
+- **Do not use btrfs for the guest root.** COLO replication corrupted a
+  btrfs root twice. The guest now uses ext4, which survived 8 failover /
+  rejoin cycles under write load with zero errors (`fsck.ext4 -fn` clean on
+  both hosts' images).
 
 ## Guest server (FerrumC)
 
@@ -146,17 +157,14 @@ and the dashboard on `9000`. The guest is reachable at `192.168.35.110` and keep
 that address across COLO failover. Start it by hand with
 `ssh 192.168.35.110 'sudo systemctl start ferrumc'`.
 
-### Guest SSH password
+### Guest SSH access
 
-The guest is not exposed to the internet. SSH password login is used because the
-cloud-init SSH-key path has been unreliable in this lab.
-
-- user: `svein`
-- password: `123454321`
-
-This password is intentionally weak and must never be used on a host reachable
-from the internet. It exists only so you can `ssh svein@192.168.35.110` from
-the private LAN.
+The guest image has SSH enabled for the `svein` user with key
+authentication (the seed installs the host's public key) and password
+authentication. The password is intentionally weak and is documented in
+the rebuild notes; the guest is local-LAN only and must never be exposed
+to the internet. See `playground/colo-test/REBUILD-2026-11-23.md` for the
+setup details.
 
 ## Automatic failover (either direction)
 
@@ -292,14 +300,30 @@ workstation tool: nothing is installed on the workstation beyond Python.
 
 ## Troubleshooting
 
-**Minecraft says "connection reset" but the guest pings and the dashboard is up.**
-Capture at the guest's game port first. If the client sends FIN/RST and the guest
-sends nothing, the guest's application layer is not answering; the network and
-COLO are fine. A capture during a failover shows this as a burst of late
-SYN-ACKs, not a server RST. If the guest's TCP stack still accepts connections
-but Minecraft handshakes time out, `ferrumc.service` inside the guest is wedged
-and needs a restart. The guest seed does not enable `sshd`, so use the QEMU
-console or add SSH to the seed. `colo.py` does not restart the guest's server.
+**Minecraft says "connection reset" but the guest pings and the dashboard
+is up.** Check two things before suspecting a wedge:
+
+1. **Protocol version.** FerrumC speaks one specific Minecraft protocol.
+   The current binary is 1.21.8 (protocol 772). A status ping with a
+   different protocol version will connect and then time out, which looks
+   exactly like a wedged server. Use the matching client version.
+2. **Disk I/O under COLO.** During world generation, every write goes
+   through the replication path. On this lab's HDDs, generation can take
+   10+ minutes and the guest's I/O thread sits in uninterruptible sleep.
+   The journal shows `Schedule 'tick' overran` warnings. This is not a
+   crash — wait for `Server is ready` in the journal.
+
+If the server is truly wedged (no `tick` warnings, no `Server is ready`,
+status ping with the right protocol still times out), restart
+`ferrumc.service`. The guest seed does not enable `sshd` by default; the
+current image has it enabled with password auth for `svein` (see the
+rebuild doc). `colo.py` does not restart the guest's server.
+
+**Failover drops the client connection.** During a host reboot the guest
+is unreachable for 60–80 s (the whole host restarts, not just QEMU).
+Watchdog failover itself is 0.3–0.4 s, but the reboot window is what the
+client sees. A power-pull test (not a reboot) keeps the gap under 1 s.
+The client must reconnect after the rejoin completes.
 
 **The monitor shows the wrong primary.** The agent reports the role from QMP
 `query-colo-status`, not from the migration socket. If a host shows a stale
