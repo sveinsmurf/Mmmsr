@@ -146,6 +146,18 @@ and the dashboard on `9000`. The guest is reachable at `192.168.35.110` and keep
 that address across COLO failover. Start it by hand with
 `ssh 192.168.35.110 'sudo systemctl start ferrumc'`.
 
+### Guest SSH password
+
+The guest is not exposed to the internet. SSH password login is used because the
+cloud-init SSH-key path has been unreliable in this lab.
+
+- user: `svein`
+- password: `123454321`
+
+This password is intentionally weak and must never be used on a host reachable
+from the internet. It exists only so you can `ssh svein@192.168.35.110` from
+the private LAN.
+
 ## Automatic failover (either direction)
 
 `colo-watchdog.py` runs on **both** hosts as `colo-watchdog.service` (enabled,

@@ -270,9 +270,17 @@ users:
   - name: svein
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
+    # cloud-init locks the password for existing users by default, which makes
+    # SSH password login impossible. lock_passwd: false prevents that; the
+    # actual password is set via chpasswd in runcmd below so it works even when
+    # the user already exists in the image.
+    lock_passwd: false
     ssh_authorized_keys:
 {keys}
-ssh_pwauth: false
+ssh_pwauth: true
+ssh_deletekeys: false
+packages:
+  - openssh
 write_files:
   - path: /etc/systemd/system/ferrumc.service
     permissions: '0644'
@@ -295,6 +303,9 @@ write_files:
 runcmd:
   - chown -R svein:svein /home/svein
   - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, sshd]
+  # Intended for private LAN access only. Do not expose this guest to the internet.
+  - [sh, -c, "echo 'svein:123454321' | chpasswd"]
   - [sh, -c, 'if [ -x /home/svein/ferrumc/ferrumc ]; then systemctl enable --now ferrumc.service; fi']
 """
     network_config = f"""version: 2
